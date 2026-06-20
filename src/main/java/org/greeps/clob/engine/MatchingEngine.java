@@ -145,15 +145,16 @@ public final class MatchingEngine implements Runnable {
     }
 
     private void processModify(long orderId, long newPrice, long newQuantity) {
-        Order existing = book.find(orderId);
-        if (existing == null) return;
+        // Remove from book without cancelling: same Order object, same orderId retained
+        Order order = book.remove(orderId);
+        if (order == null) return;
 
-        // Capture before cancel returns order to pool
-        Side      side = existing.side();
-        OrderType type = existing.type();
+        long timestamp = System.nanoTime();
+        order.modify(newPrice, newQuantity, timestamp);
+        publishOrderModified(orderId, order.side(), order.type(), newPrice, newQuantity, timestamp);
 
-        processCancelById(orderId, CancelReason.CANCELLED);
-        processSubmit(instrumentId, side, type, newPrice, newQuantity);
+        // Re-enter matching — order lands at the back of its price level (loses time priority)
+        matchLimit(order);
     }
 
     // --- matching ---
@@ -290,6 +291,20 @@ public final class MatchingEngine implements Runnable {
         e.fillQty       = fillQty;
         e.remainingQty  = remainingQty;
         e.fillPrice     = fillPrice;
+        e.timestamp     = ts;
+        eventRing.publish(e);
+    }
+
+    private void publishOrderModified(long orderId, Side side, OrderType type,
+                                      long price, long qty, long ts) {
+        MutableEvent e  = eventRing.claim();
+        e.eventType     = EventType.ORDER_MODIFIED;
+        e.orderId       = orderId;
+        e.instrumentId  = instrumentId;
+        e.side          = side;
+        e.orderType     = type;
+        e.price         = price;
+        e.quantity      = qty;
         e.timestamp     = ts;
         eventRing.publish(e);
     }

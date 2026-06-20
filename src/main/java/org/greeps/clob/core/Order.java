@@ -44,6 +44,15 @@ public final class Order {
         status = OrderStatus.CANCELLED;
     }
 
+    /** Update price and quantity in-place. Resets remaining and status so the order re-enters matching as fresh. */
+    public void modify(long newPrice, long newQuantity, long newTimestamp) {
+        this.price     = newPrice;
+        this.quantity  = newQuantity;
+        this.remaining = newQuantity;
+        this.timestamp = newTimestamp;
+        this.status    = OrderStatus.NEW;
+    }
+
     public long orderId()        { return orderId; }
     public String instrumentId() { return instrumentId; }
     public Side side()           { return side; }

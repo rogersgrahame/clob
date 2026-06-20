@@ -203,13 +203,31 @@ class MatchingEngineTest {
         long second = submitLimit(Side.ASK, 100, 5);
 
         modify(first, 100, 10);
-        drain();
+        List<MutableEvent> modifyEvents = drain();
+
+        // single ORDER_MODIFIED with the original orderId — no cancel/re-submit
+        assertEquals(1, modifyEvents.size());
+        assertEquals(EventType.ORDER_MODIFIED, modifyEvents.getFirst().eventType);
+        assertEquals(first, modifyEvents.getFirst().orderId);
 
         engine.processSync(new SubmitOrderCommand("AAPL", Side.BID, OrderType.LIMIT, 100, 5));
         List<MutableEvent> emitted = drain();
 
+        // second is now at the head of the queue — it fills first
         MutableEvent trade = firstOfType(emitted, EventType.TRADE);
         assertEquals(second, trade.sellOrderId);
+    }
+
+    @Test
+    void modify_retainsOriginalOrderId() {
+        long originalId = submitLimit(Side.ASK, 100, 10);
+
+        modify(originalId, 101, 5);
+        List<MutableEvent> events = drain();
+
+        assertEquals(1, events.size());
+        assertEquals(EventType.ORDER_MODIFIED, events.getFirst().eventType);
+        assertEquals(originalId, events.getFirst().orderId);
     }
 
     @Test
