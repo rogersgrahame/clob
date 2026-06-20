@@ -3,11 +3,10 @@ package org.greeps.clob.engine;
 import org.greeps.clob.command.CancelOrderCommand;
 import org.greeps.clob.command.ModifyOrderCommand;
 import org.greeps.clob.command.SubmitOrderCommand;
-import org.greeps.clob.event.Event;
 import org.greeps.clob.id.OrderIdGenerator;
+import org.greeps.clob.ring.EventRingBuffer;
 
 import java.util.Map;
-import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -16,19 +15,19 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class OrderRouter {
 
-    private final OrderIdGenerator idGenerator;
-    private final Queue<Event> eventQueue;
+    private final OrderIdGenerator           idGenerator;
+    private final EventRingBuffer            eventRing;
     private final Map<String, MatchingEngine> engines = new ConcurrentHashMap<>();
 
-    public OrderRouter(OrderIdGenerator idGenerator, Queue<Event> eventQueue) {
+    public OrderRouter(OrderIdGenerator idGenerator, EventRingBuffer eventRing) {
         this.idGenerator = idGenerator;
-        this.eventQueue = eventQueue;
+        this.eventRing   = eventRing;
     }
 
     /** Register a new instrument and start its matching engine. */
     public void registerInstrument(String instrumentId) {
         engines.computeIfAbsent(instrumentId, id -> {
-            MatchingEngine engine = new MatchingEngine(id, idGenerator, eventQueue);
+            MatchingEngine engine = new MatchingEngine(id, idGenerator, eventRing);
             engine.start();
             return engine;
         });

@@ -5,18 +5,16 @@ import org.greeps.clob.command.SubmitOrderCommand;
 import org.greeps.clob.core.OrderType;
 import org.greeps.clob.core.Side;
 import org.greeps.clob.engine.MatchingEngine;
-import org.greeps.clob.event.Event;
-import org.greeps.clob.event.OrderAcceptedEvent;
 import org.greeps.clob.id.OrderIdGenerator;
+import org.greeps.clob.ring.EventRingBuffer;
+import org.greeps.clob.ring.EventType;
+import org.greeps.clob.ring.MutableEvent;
 import org.openjdk.jmh.annotations.*;
 
-import java.util.ArrayDeque;
-import java.util.Deque;
-import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Baseline benchmarks with TreeMap / ArrayDeque (Phase 1 collections).
+ * Baseline benchmarks with TreeMap / ArrayDeque / OrderPool / ring buffers (Phase 1-3).
  * Store results — future collection swaps are compared against these numbers.
  */
 @BenchmarkMode({Mode.Throughput, Mode.SampleTime})
@@ -28,40 +26,31 @@ import java.util.concurrent.TimeUnit;
 public class OrderBookBenchmark {
 
     private MatchingEngine engine;
-    private LinkedTransferQueue<Event> eventQueue;
-    private long bidPrice;
-    private long askPrice;
-
-    // for cancel-heavy benchmark
-    private final Deque<Long> restingOrderIds = new ArrayDeque<>();
+    private EventRingBuffer eventRing;
 
     @Setup(Level.Trial)
     public void setup() {
-        eventQueue = new LinkedTransferQueue<>();
-        engine = new MatchingEngine("BENCH", new OrderIdGenerator(), eventQueue);
+        eventRing = new EventRingBuffer(8192);
+        engine    = new MatchingEngine("BENCH", new OrderIdGenerator(), eventRing);
     }
 
     @TearDown(Level.Trial)
     public void teardown() {
-        eventQueue.clear();
+        eventRing.drainAll();
     }
 
     // -----------------------------------------------------------------------
-    // Throughput: mixed limit + market, balanced buy/sell with no resting depth
+    // Throughput: every ASK+BID pair at the same price produces a full fill
     // -----------------------------------------------------------------------
 
-    /**
-     * Alternating ASK then BID at the same price — every pair produces a full fill.
-     * Measures raw matching throughput (orders/sec) with zero resting book state.
-     */
     @Benchmark
     @BenchmarkMode(Mode.Throughput)
     @OutputTimeUnit(TimeUnit.SECONDS)
     public void throughput_matchingPairs() {
         engine.processSync(new SubmitOrderCommand("BENCH", Side.ASK, OrderType.LIMIT, 100, 1));
-        eventQueue.clear();
+        eventRing.drainAll();
         engine.processSync(new SubmitOrderCommand("BENCH", Side.BID, OrderType.LIMIT, 100, 1));
-        eventQueue.clear();
+        eventRing.drainAll();
     }
 
     // -----------------------------------------------------------------------
@@ -71,23 +60,19 @@ public class OrderBookBenchmark {
     @Setup(Level.Invocation)
     public void seedRestingOrder() {
         engine.processSync(new SubmitOrderCommand("BENCH", Side.ASK, OrderType.LIMIT, 100, 1));
-        // extract orderId so we can reference it if needed; discard event
-        eventQueue.clear();
+        eventRing.drainAll();
     }
 
-    /**
-     * Single aggressive BID against the pre-seeded ASK — measures end-to-end matching latency.
-     */
     @Benchmark
     @BenchmarkMode(Mode.SampleTime)
     @OutputTimeUnit(TimeUnit.MICROSECONDS)
     public void latency_singleMatch() {
         engine.processSync(new SubmitOrderCommand("BENCH", Side.BID, OrderType.LIMIT, 100, 1));
-        eventQueue.clear();
+        eventRing.drainAll();
     }
 
     // -----------------------------------------------------------------------
-    // Cancel-heavy: 50% submit, 50% cancel — stresses HashMap + TreeMap removal
+    // Cancel-heavy: 50% submit, 50% cancel
     // -----------------------------------------------------------------------
 
     @Benchmark
@@ -95,10 +80,18 @@ public class OrderBookBenchmark {
     @OutputTimeUnit(TimeUnit.SECONDS)
     public void cancelHeavy_submitThenCancel() {
         engine.processSync(new SubmitOrderCommand("BENCH", Side.ASK, OrderType.LIMIT, 101, 1));
-        Event accepted = eventQueue.poll();
-        if (accepted instanceof OrderAcceptedEvent e) {
-            engine.processSync(new CancelOrderCommand(e.orderId(), "BENCH"));
-            eventQueue.clear();
+
+        // Retrieve the accepted orderId from the ring buffer
+        MutableEvent accepted = eventRing.poll();
+        long orderId = 0;
+        if (accepted != null && accepted.eventType == EventType.ORDER_ACCEPTED) {
+            orderId = accepted.orderId;
+            eventRing.done(accepted);
+        }
+
+        if (orderId != 0) {
+            engine.processSync(new CancelOrderCommand(orderId, "BENCH"));
+            eventRing.drainAll();
         }
     }
 }

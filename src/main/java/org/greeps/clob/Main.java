@@ -4,27 +4,25 @@ import org.greeps.clob.command.SubmitOrderCommand;
 import org.greeps.clob.core.OrderType;
 import org.greeps.clob.core.Side;
 import org.greeps.clob.engine.OrderRouter;
-import org.greeps.clob.event.Event;
 import org.greeps.clob.id.OrderIdGenerator;
-
-import java.util.concurrent.LinkedTransferQueue;
+import org.greeps.clob.ring.EventRingBuffer;
+import org.greeps.clob.ring.MutableEvent;
 
 public class Main {
 
     public static void main(String[] args) throws InterruptedException {
-        LinkedTransferQueue<Event> eventQueue = new LinkedTransferQueue<>();
-        OrderRouter router = new OrderRouter(new OrderIdGenerator(), eventQueue);
+        EventRingBuffer eventRing = new EventRingBuffer(4096);
+        OrderRouter router = new OrderRouter(new OrderIdGenerator(), eventRing);
         router.registerInstrument("AAPL");
 
-        // Consumer thread — prints every event
+        // Consumer thread — spins on the event ring buffer
         Thread consumer = Thread.ofPlatform().name("event-consumer").start(() -> {
             while (!Thread.currentThread().isInterrupted()) {
-                try {
-                    Event event = eventQueue.take();
-                    System.out.println(event);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
+                MutableEvent event = eventRing.poll();
+                if (event == null) { Thread.onSpinWait(); continue; }
+                System.out.printf("%s orderId=%-4d instrument=%s%n",
+                        event.eventType, event.orderId, event.instrumentId);
+                eventRing.done(event);
             }
         });
 

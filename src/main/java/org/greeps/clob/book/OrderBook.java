@@ -4,46 +4,32 @@ import org.eclipse.collections.impl.map.mutable.primitive.LongObjectHashMap;
 import org.greeps.clob.core.Order;
 import org.greeps.clob.core.Side;
 
-import java.util.Comparator;
-import java.util.Map;
-import java.util.TreeMap;
-
 /**
  * Per-instrument order book.
  *
- * Phase 1 swap points:
- *   - TreeMap  → custom primitive-keyed sorted structure (Step 5)
- *   - ArrayDeque (inside PriceLevel) → object-pool or off-heap structure
- *
- * Phase 2 (this step): order index uses LongObjectHashMap — no Long boxing on orderId lookups.
+ * Bids and asks are managed by PriceLadder — a sorted long[] of active prices
+ * paired with a LongObjectHashMap for O(1) level access. No Long boxing on any
+ * price-level operation.
  */
 public final class OrderBook {
-
-    // Bids: highest price first
-    private final TreeMap<Long, PriceLevel> bids = new TreeMap<>(Comparator.reverseOrder());
-    // Asks: lowest price first (natural order)
-    private final TreeMap<Long, PriceLevel> asks = new TreeMap<>();
-    // Primitive-keyed map: zero Long boxing on orderId lookups
-    private final LongObjectHashMap<Order> orderIndex = new LongObjectHashMap<>();
 
     /** Sentinel returned by bestOppositePrice() when the opposite side is empty. */
     public static final long NO_PRICE = Long.MIN_VALUE;
 
+    private final PriceLadder              bids       = new PriceLadder(true);   // descending: highest first
+    private final PriceLadder              asks       = new PriceLadder(false);  // ascending:  lowest first
+    private final LongObjectHashMap<Order> orderIndex = new LongObjectHashMap<>();
+
     public void add(Order order) {
         orderIndex.put(order.orderId(), order);
-        sideMap(order.side())
-                .computeIfAbsent(order.price(), p -> new PriceLevel())
-                .add(order);
+        ladderFor(order.side()).getOrCreate(order.price()).add(order);
     }
 
     public Order find(long orderId) {
         return orderIndex.get(orderId);
     }
 
-    /**
-     * Remove an order by ID (used for explicit cancel).
-     * Returns the removed order, or null if not found.
-     */
+    /** Remove an order by ID (explicit cancel). Returns the order, or null if not found. */
     public Order remove(long orderId) {
         Order order = orderIndex.removeKey(orderId);
         if (order == null) return null;
@@ -51,49 +37,46 @@ public final class OrderBook {
         return order;
     }
 
-    /**
-     * Remove the front order from the best opposite level after a full fill during matching.
-     * Cleans up the level from the TreeMap if it becomes empty.
-     */
+    /** Remove the front order from the best resting level after a full fill during matching. */
     public void removeTopOfBook(Side restingSide) {
-        TreeMap<Long, PriceLevel> map = sideMap(restingSide);
-        Map.Entry<Long, PriceLevel> best = map.firstEntry();
-        if (best == null) return;
-        Order removed = best.getValue().poll();
+        PriceLadder ladder    = ladderFor(restingSide);
+        if (ladder.isEmpty()) return;
+        long       bestPrice  = ladder.bestPrice();
+        PriceLevel level      = ladder.bestLevel();
+        Order      removed    = level.poll();
         if (removed != null) orderIndex.removeKey(removed.orderId());
-        if (best.getValue().isEmpty()) map.remove(best.getKey());
+        if (level.isEmpty()) ladder.remove(bestPrice);
     }
 
-    /** Peek at the best resting order on the opposite side without removing it. */
+    /** Peek at the front order on the best opposite level without removing it. */
     public Order peekBestOpposite(Side aggressiveSide) {
-        Map.Entry<Long, PriceLevel> best = sideMap(opposite(aggressiveSide)).firstEntry();
-        return best != null ? best.getValue().peek() : null;
+        PriceLevel level = ladderFor(opposite(aggressiveSide)).bestLevel();
+        return level != null ? level.peek() : null;
     }
 
     /**
      * Best resting price on the opposite side as a primitive long.
-     * Returns NO_PRICE if the opposite side is empty — avoids Long boxing entirely.
+     * Returns NO_PRICE if the opposite side is empty.
      */
     public long bestOppositePrice(Side aggressiveSide) {
-        Map.Entry<Long, PriceLevel> best = sideMap(opposite(aggressiveSide)).firstEntry();
-        return best != null ? best.getKey() : NO_PRICE;
+        return ladderFor(opposite(aggressiveSide)).bestPrice();
     }
 
     public boolean isEmpty(Side side) {
-        return sideMap(side).isEmpty();
+        return ladderFor(side).isEmpty();
     }
 
     // --- private helpers ---
 
     private void removeFromLevel(Order order) {
-        TreeMap<Long, PriceLevel> map = sideMap(order.side());
-        PriceLevel level = map.get(order.price());
+        PriceLadder ladder = ladderFor(order.side());
+        PriceLevel  level  = ladder.get(order.price());
         if (level == null) return;
         level.remove(order);
-        if (level.isEmpty()) map.remove(order.price());
+        if (level.isEmpty()) ladder.remove(order.price());
     }
 
-    private TreeMap<Long, PriceLevel> sideMap(Side side) {
+    private PriceLadder ladderFor(Side side) {
         return side == Side.BID ? bids : asks;
     }
 

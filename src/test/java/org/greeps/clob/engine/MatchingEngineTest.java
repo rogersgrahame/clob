@@ -5,44 +5,48 @@ import org.greeps.clob.command.ModifyOrderCommand;
 import org.greeps.clob.command.SubmitOrderCommand;
 import org.greeps.clob.core.OrderType;
 import org.greeps.clob.core.Side;
-import org.greeps.clob.event.*;
+import org.greeps.clob.event.CancelReason;
 import org.greeps.clob.id.OrderIdGenerator;
+import org.greeps.clob.ring.EventRingBuffer;
+import org.greeps.clob.ring.EventType;
+import org.greeps.clob.ring.MutableEvent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.LinkedTransferQueue;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class MatchingEngineTest {
 
     private MatchingEngine engine;
-    private LinkedTransferQueue<Event> events;
+    private EventRingBuffer eventRing;
 
     @BeforeEach
     void setUp() {
-        events = new LinkedTransferQueue<>();
-        engine = new MatchingEngine("AAPL", new OrderIdGenerator(), events);
+        eventRing = new EventRingBuffer(256);
+        engine    = new MatchingEngine("AAPL", new OrderIdGenerator(), eventRing);
     }
 
     // --- helpers ---
 
-    private List<Event> drain() {
-        List<Event> list = new ArrayList<>();
-        events.drainTo(list);
+    /** Drain all available events; call done() on each slot as we go. */
+    private List<MutableEvent> drain() {
+        List<MutableEvent> list = new ArrayList<>();
+        MutableEvent slot;
+        while ((slot = eventRing.poll()) != null) {
+            list.add(slot);
+            eventRing.done(slot);
+        }
         return list;
     }
 
     private long submitLimit(Side side, long price, long qty) {
         engine.processSync(new SubmitOrderCommand("AAPL", side, OrderType.LIMIT, price, qty));
-        return ((OrderAcceptedEvent) drain().getFirst()).orderId();
-    }
-
-    private long submitMarket(Side side, long qty) {
-        engine.processSync(new SubmitOrderCommand("AAPL", side, OrderType.MARKET, 0, qty));
-        return ((OrderAcceptedEvent) drain().getFirst()).orderId();
+        List<MutableEvent> emitted = drain();
+        assertEquals(EventType.ORDER_ACCEPTED, emitted.getFirst().eventType);
+        return emitted.getFirst().orderId;
     }
 
     private void cancel(long orderId) {
@@ -51,6 +55,14 @@ class MatchingEngineTest {
 
     private void modify(long orderId, long newPrice, long newQty) {
         engine.processSync(new ModifyOrderCommand(orderId, "AAPL", newPrice, newQty));
+    }
+
+    private MutableEvent firstOfType(List<MutableEvent> events, EventType type) {
+        return events.stream().filter(e -> e.eventType == type).findFirst().orElseThrow();
+    }
+
+    private List<MutableEvent> allOfType(List<MutableEvent> events, EventType type) {
+        return events.stream().filter(e -> e.eventType == type).toList();
     }
 
     // -----------------------------------------------------------------------
@@ -62,23 +74,24 @@ class MatchingEngineTest {
         long askId = submitLimit(Side.ASK, 100, 10);
 
         engine.processSync(new SubmitOrderCommand("AAPL", Side.BID, OrderType.LIMIT, 100, 10));
-        List<Event> emitted = drain();
+        List<MutableEvent> emitted = drain();
 
-        OrderAcceptedEvent accepted  = (OrderAcceptedEvent) emitted.get(0);
-        TradeEvent          trade    = (TradeEvent)          emitted.get(1);
-        OrderFilledEvent    restFill = (OrderFilledEvent)    emitted.get(2);
-        OrderFilledEvent    aggFill  = (OrderFilledEvent)    emitted.get(3);
+        long aggId = firstOfType(emitted, EventType.ORDER_ACCEPTED).orderId;
 
-        assertEquals(100,   trade.price());
-        assertEquals(10,    trade.quantity());
-        assertEquals(askId, trade.sellOrderId());
-        assertEquals(accepted.orderId(), trade.buyOrderId());
+        MutableEvent trade    = firstOfType(emitted, EventType.TRADE);
+        assertEquals(100,   trade.price);
+        assertEquals(10,    trade.quantity);
+        assertEquals(askId, trade.sellOrderId);
+        assertEquals(aggId, trade.buyOrderId);
 
-        assertTrue(restFill.isFull());
-        assertEquals(askId, restFill.orderId());
+        List<MutableEvent> fills = allOfType(emitted, EventType.ORDER_FILLED);
+        assertEquals(2, fills.size());
 
-        assertTrue(aggFill.isFull());
-        assertEquals(accepted.orderId(), aggFill.orderId());
+        MutableEvent restFill = fills.stream().filter(f -> f.orderId == askId).findFirst().orElseThrow();
+        assertTrue(restFill.isFullFill());
+
+        MutableEvent aggFill = fills.stream().filter(f -> f.orderId == aggId).findFirst().orElseThrow();
+        assertTrue(aggFill.isFullFill());
     }
 
     // -----------------------------------------------------------------------
@@ -90,23 +103,26 @@ class MatchingEngineTest {
         submitLimit(Side.ASK, 100, 5);
 
         engine.processSync(new SubmitOrderCommand("AAPL", Side.BID, OrderType.LIMIT, 100, 10));
-        List<Event> emitted = drain();
+        List<MutableEvent> emitted = drain();
 
-        // accepted + trade + restFill(full) — no aggFill, incoming rests with 5 remaining
+        // accepted + trade + restFill(full) — incoming rests, no fill event for it
         assertEquals(3, emitted.size());
-        assertInstanceOf(OrderAcceptedEvent.class, emitted.get(0));
-        TradeEvent trade = (TradeEvent) emitted.get(1);
-        assertEquals(5, trade.quantity());
-        assertTrue(((OrderFilledEvent) emitted.get(2)).isFull());
+        assertEquals(EventType.ORDER_ACCEPTED, emitted.get(0).eventType);
+        MutableEvent trade = firstOfType(emitted, EventType.TRADE);
+        assertEquals(5, trade.quantity);
 
-        // A new ask at same price should fill the resting bid remainder
+        MutableEvent restFill = firstOfType(emitted, EventType.ORDER_FILLED);
+        assertTrue(restFill.isFullFill());
+
+        // A new ask should fill the resting bid remainder
         engine.processSync(new SubmitOrderCommand("AAPL", Side.ASK, OrderType.LIMIT, 100, 5));
-        List<Event> second = drain();
-        assertTrue(second.stream().anyMatch(e -> e instanceof TradeEvent t && t.quantity() == 5));
+        List<MutableEvent> second = drain();
+        MutableEvent t2 = firstOfType(second, EventType.TRADE);
+        assertEquals(5, t2.quantity);
     }
 
     // -----------------------------------------------------------------------
-    // Limit order — price does not cross (no match)
+    // Limit order — price does not cross
     // -----------------------------------------------------------------------
 
     @Test
@@ -114,14 +130,14 @@ class MatchingEngineTest {
         submitLimit(Side.ASK, 101, 10);
 
         engine.processSync(new SubmitOrderCommand("AAPL", Side.BID, OrderType.LIMIT, 100, 10));
-        List<Event> emitted = drain();
+        List<MutableEvent> emitted = drain();
 
         assertEquals(1, emitted.size());
-        assertInstanceOf(OrderAcceptedEvent.class, emitted.getFirst());
+        assertEquals(EventType.ORDER_ACCEPTED, emitted.getFirst().eventType);
     }
 
     // -----------------------------------------------------------------------
-    // Limit order — multiple price levels consumed
+    // Limit order — sweeps multiple price levels
     // -----------------------------------------------------------------------
 
     @Test
@@ -130,16 +146,15 @@ class MatchingEngineTest {
         submitLimit(Side.ASK, 101, 5);
 
         engine.processSync(new SubmitOrderCommand("AAPL", Side.BID, OrderType.LIMIT, 102, 10));
-        List<Event> emitted = drain();
+        List<MutableEvent> emitted = drain();
 
-        List<TradeEvent> trades = emitted.stream()
-                .filter(e -> e instanceof TradeEvent).map(e -> (TradeEvent) e).toList();
+        List<MutableEvent> trades = allOfType(emitted, EventType.TRADE);
         assertEquals(2, trades.size());
-        assertEquals(100, trades.get(0).price());
-        assertEquals(101, trades.get(1).price());
+        assertEquals(100, trades.get(0).price);
+        assertEquals(101, trades.get(1).price);
 
-        long fullFills = emitted.stream()
-                .filter(e -> e instanceof OrderFilledEvent f && f.isFull()).count();
+        long fullFills = allOfType(emitted, EventType.ORDER_FILLED).stream()
+                .filter(MutableEvent::isFullFill).count();
         assertEquals(3, fullFills); // both resting + the aggressive
     }
 
@@ -151,12 +166,13 @@ class MatchingEngineTest {
     void cancel_restingOrder_emitsCancelledEvent() {
         long askId = submitLimit(Side.ASK, 100, 10);
         cancel(askId);
-        List<Event> emitted = drain();
+        List<MutableEvent> emitted = drain();
 
         assertEquals(1, emitted.size());
-        OrderCancelledEvent cancelled = (OrderCancelledEvent) emitted.getFirst();
-        assertEquals(askId, cancelled.orderId());
-        assertEquals(CancelReason.CANCELLED, cancelled.reason());
+        MutableEvent cancelled = emitted.getFirst();
+        assertEquals(EventType.ORDER_CANCELLED, cancelled.eventType);
+        assertEquals(askId, cancelled.orderId);
+        assertEquals(CancelReason.CANCELLED, cancelled.cancelReason);
     }
 
     @Test
@@ -172,14 +188,13 @@ class MatchingEngineTest {
         drain();
 
         engine.processSync(new SubmitOrderCommand("AAPL", Side.BID, OrderType.LIMIT, 100, 10));
-        List<Event> emitted = drain();
-
+        List<MutableEvent> emitted = drain();
         assertEquals(1, emitted.size());
-        assertInstanceOf(OrderAcceptedEvent.class, emitted.getFirst());
+        assertEquals(EventType.ORDER_ACCEPTED, emitted.getFirst().eventType);
     }
 
     // -----------------------------------------------------------------------
-    // Modify — cancel + re-submit, loses time priority
+    // Modify — loses time priority
     // -----------------------------------------------------------------------
 
     @Test
@@ -190,14 +205,11 @@ class MatchingEngineTest {
         modify(first, 100, 10);
         drain();
 
-        // A bid of qty 5 should fill 'second' (now front of queue), not the modified order
         engine.processSync(new SubmitOrderCommand("AAPL", Side.BID, OrderType.LIMIT, 100, 5));
-        List<Event> emitted = drain();
+        List<MutableEvent> emitted = drain();
 
-        TradeEvent trade = emitted.stream()
-                .filter(e -> e instanceof TradeEvent).map(e -> (TradeEvent) e)
-                .findFirst().orElseThrow();
-        assertEquals(second, trade.sellOrderId());
+        MutableEvent trade = firstOfType(emitted, EventType.TRADE);
+        assertEquals(second, trade.sellOrderId);
     }
 
     @Test
@@ -215,15 +227,16 @@ class MatchingEngineTest {
         submitLimit(Side.ASK, 100, 10);
 
         engine.processSync(new SubmitOrderCommand("AAPL", Side.BID, OrderType.MARKET, 0, 10));
-        List<Event> emitted = drain();
+        List<MutableEvent> emitted = drain();
 
-        assertTrue(emitted.stream().anyMatch(e -> e instanceof TradeEvent t && t.quantity() == 10));
-        assertTrue(emitted.stream().anyMatch(e -> e instanceof OrderFilledEvent f && f.isFull()));
-        assertFalse(emitted.stream().anyMatch(e -> e instanceof OrderCancelledEvent));
+        assertFalse(allOfType(emitted, EventType.TRADE).isEmpty());
+        assertTrue(allOfType(emitted, EventType.ORDER_FILLED).stream()
+                .anyMatch(MutableEvent::isFullFill));
+        assertTrue(allOfType(emitted, EventType.ORDER_CANCELLED).isEmpty());
     }
 
     // -----------------------------------------------------------------------
-    // Market order — insufficient liquidity (partial fill, cancel remainder)
+    // Market order — insufficient liquidity
     // -----------------------------------------------------------------------
 
     @Test
@@ -231,26 +244,21 @@ class MatchingEngineTest {
         submitLimit(Side.ASK, 100, 3);
 
         engine.processSync(new SubmitOrderCommand("AAPL", Side.BID, OrderType.MARKET, 0, 10));
-        List<Event> emitted = drain();
+        List<MutableEvent> emitted = drain();
 
-        TradeEvent trade = emitted.stream()
-                .filter(e -> e instanceof TradeEvent).map(e -> (TradeEvent) e)
-                .findFirst().orElseThrow();
-        assertEquals(3, trade.quantity());
+        MutableEvent trade = firstOfType(emitted, EventType.TRADE);
+        assertEquals(3, trade.quantity);
 
-        OrderCancelledEvent cancelled = emitted.stream()
-                .filter(e -> e instanceof OrderCancelledEvent).map(e -> (OrderCancelledEvent) e)
-                .findFirst().orElseThrow();
-        assertEquals(CancelReason.INSUFFICIENT_LIQUIDITY, cancelled.reason());
+        MutableEvent cancelled = firstOfType(emitted, EventType.ORDER_CANCELLED);
+        assertEquals(CancelReason.INSUFFICIENT_LIQUIDITY, cancelled.cancelReason);
     }
 
     @Test
     void marketOrder_emptyBook_cancelImmediately() {
         engine.processSync(new SubmitOrderCommand("AAPL", Side.BID, OrderType.MARKET, 0, 5));
-        List<Event> emitted = drain();
+        List<MutableEvent> emitted = drain();
 
-        long cancelCount = emitted.stream().filter(e -> e instanceof OrderCancelledEvent).count();
-        assertEquals(1, cancelCount);
+        assertEquals(1, allOfType(emitted, EventType.ORDER_CANCELLED).size());
     }
 
     // -----------------------------------------------------------------------
@@ -263,11 +271,10 @@ class MatchingEngineTest {
         long second = submitLimit(Side.ASK, 100, 5);
 
         engine.processSync(new SubmitOrderCommand("AAPL", Side.BID, OrderType.LIMIT, 100, 5));
-        List<Event> emitted = drain();
+        List<MutableEvent> emitted = drain();
 
-        TradeEvent trade = emitted.stream()
-                .filter(e -> e instanceof TradeEvent).map(e -> (TradeEvent) e)
-                .findFirst().orElseThrow();
-        assertEquals(first, trade.sellOrderId());
+        MutableEvent trade = firstOfType(emitted, EventType.TRADE);
+        assertEquals(first, trade.sellOrderId);
+        assertNotEquals(second, trade.sellOrderId);
     }
 }
