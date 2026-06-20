@@ -1,10 +1,10 @@
 package org.greeps.clob.book;
 
+import org.eclipse.collections.impl.map.mutable.primitive.LongObjectHashMap;
 import org.greeps.clob.core.Order;
 import org.greeps.clob.core.Side;
 
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.TreeMap;
 
@@ -12,8 +12,10 @@ import java.util.TreeMap;
  * Per-instrument order book.
  *
  * Phase 1 swap points:
- *   - TreeMap  → custom price-indexed array or skip list
+ *   - TreeMap  → custom primitive-keyed sorted structure (Step 5)
  *   - ArrayDeque (inside PriceLevel) → object-pool or off-heap structure
+ *
+ * Phase 2 (this step): order index uses LongObjectHashMap — no Long boxing on orderId lookups.
  */
 public final class OrderBook {
 
@@ -21,8 +23,11 @@ public final class OrderBook {
     private final TreeMap<Long, PriceLevel> bids = new TreeMap<>(Comparator.reverseOrder());
     // Asks: lowest price first (natural order)
     private final TreeMap<Long, PriceLevel> asks = new TreeMap<>();
-    // O(1) lookup by orderId for cancel / modify
-    private final HashMap<Long, Order> orderIndex = new HashMap<>();
+    // Primitive-keyed map: zero Long boxing on orderId lookups
+    private final LongObjectHashMap<Order> orderIndex = new LongObjectHashMap<>();
+
+    /** Sentinel returned by bestOppositePrice() when the opposite side is empty. */
+    public static final long NO_PRICE = Long.MIN_VALUE;
 
     public void add(Order order) {
         orderIndex.put(order.orderId(), order);
@@ -40,9 +45,9 @@ public final class OrderBook {
      * Returns the removed order, or null if not found.
      */
     public Order remove(long orderId) {
-        Order order = orderIndex.remove(orderId);
+        Order order = orderIndex.removeKey(orderId);
         if (order == null) return null;
-        removefromLevel(order);
+        removeFromLevel(order);
         return order;
     }
 
@@ -55,7 +60,7 @@ public final class OrderBook {
         Map.Entry<Long, PriceLevel> best = map.firstEntry();
         if (best == null) return;
         Order removed = best.getValue().poll();
-        if (removed != null) orderIndex.remove(removed.orderId());
+        if (removed != null) orderIndex.removeKey(removed.orderId());
         if (best.getValue().isEmpty()) map.remove(best.getKey());
     }
 
@@ -65,10 +70,13 @@ public final class OrderBook {
         return best != null ? best.getValue().peek() : null;
     }
 
-    /** Best resting price on the opposite side, or null if the book is empty. */
-    public Long bestOppositePrice(Side aggressiveSide) {
+    /**
+     * Best resting price on the opposite side as a primitive long.
+     * Returns NO_PRICE if the opposite side is empty — avoids Long boxing entirely.
+     */
+    public long bestOppositePrice(Side aggressiveSide) {
         Map.Entry<Long, PriceLevel> best = sideMap(opposite(aggressiveSide)).firstEntry();
-        return best != null ? best.getKey() : null;
+        return best != null ? best.getKey() : NO_PRICE;
     }
 
     public boolean isEmpty(Side side) {
@@ -77,7 +85,7 @@ public final class OrderBook {
 
     // --- private helpers ---
 
-    private void removefromLevel(Order order) {
+    private void removeFromLevel(Order order) {
         TreeMap<Long, PriceLevel> map = sideMap(order.side());
         PriceLevel level = map.get(order.price());
         if (level == null) return;
