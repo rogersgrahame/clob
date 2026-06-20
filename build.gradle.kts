@@ -21,6 +21,7 @@ repositories {
 }
 
 dependencies {
+    implementation("org.eclipse.collections:eclipse-collections:11.1.0")
     testImplementation(platform("org.junit:junit-bom:5.10.0"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     jmh("org.openjdk.jmh:jmh-core:1.37")
